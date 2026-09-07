@@ -457,6 +457,8 @@ def _run_duplicate_recovery_smoke() -> int:
 
 
 def main() -> int:  # pylint: disable=too-many-return-statements
+    # Keep startup barriers together so their ordering remains reviewable.
+    # pylint: disable=too-many-branches
     smoke = "--smoke" in sys.argv
     duplicate_recovery_smoke = "--smoke-duplicate-recovery" in sys.argv
 
@@ -515,7 +517,25 @@ def main() -> int:  # pylint: disable=too-many-return-statements
     if not smoke:
         from app.services import backup_service
 
-        backup_service.apply_pending_restore()
+        try:
+            backup_service.acquire_profile_lock()
+            restore_result = backup_service.apply_pending_restore()
+        except backup_service.ProfileInUseError as exc:
+            _surface_startup_error(
+                "FolioOrb profile is already open", str(exc),
+                "Quit the other FolioOrb process, then reopen this profile.",
+            )
+            return 1
+        except backup_service.RestoreRecoveryError as exc:
+            _surface_startup_error(
+                "FolioOrb database recovery requires attention", str(exc),
+                "Keep every database, staging and failed file intact. "
+                "Do not remove the restore-in-progress marker or open the profile "
+                "until the original data has been deliberately recovered.",
+            )
+            return 1
+        if restore_result and restore_result.get("installer_status") == "installing":
+            return 0
 
         # Uvicorn logs lifespan exceptions and returns normally instead of
         # propagating them to the server thread. Run the duplicate-only,

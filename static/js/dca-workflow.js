@@ -45,6 +45,8 @@
 }) {
     let initialized = false;
     let mutationInFlight = false;
+    let panelLoadId = 0;
+    let panelLoaded = false;
     let dialogState = null;
 
     const byId = id => document.getElementById(id);
@@ -123,12 +125,24 @@
         } catch (_) { /* cosmetic while offline */ }
     }
 
+    function panelLoadFailed() {
+        const status = byId("dca-load-status");
+        if (!status) return;
+        status.hidden = false;
+        const message = panelLoaded
+            ? "DCA view is stale — showing the last successful data."
+            : "Could not load DCA data. The ledger is unavailable.";
+        status.innerHTML = message + '<button type="button" class="btn btn-sm dca-chip-btn" data-dca-action="retry-panel">Retry refresh</button>';
+    }
+
     async function loadPanel() {
+        const requestId = ++panelLoadId;
         try {
             const [plans, contributionPayload] = await Promise.all([
                 workspace.json("/api/dca/plans"),
                 workspace.json("/api/dca/contributions?status=all"),
             ]);
+            if (requestId !== panelLoadId) return false;
             const contributions = contributionPayload.contributions || [];
             renderPlans(plans.plans || [], contributions);
             renderPending(
@@ -137,9 +151,19 @@
             );
             updateBadge();
             const history = byId("dca-history-list");
-            if (history && !history.hidden) loadHistory();
+            if (history && !history.hidden) await loadHistory(contributions);
+            panelLoaded = true;
+            const status = byId("dca-load-status");
+            if (status) {
+                status.hidden = true;
+                status.innerHTML = "";
+            }
+            return true;
         } catch (error) {
+            if (requestId !== panelLoadId) return false;
             log.warn("DCA panel load failed:", error);
+            panelLoadFailed();
+            return false;
         }
     }
 
@@ -264,12 +288,13 @@
         if (show) loadHistory();
     }
 
-    async function loadHistory() {
+    async function loadHistory(contributions = null) {
         const list = byId("dca-history-list");
         if (!list) return;
         try {
-            const payload = await workspace.json("/api/dca/contributions?status=all");
-            const rows = (payload.contributions || []).filter(item => item.status !== "pending");
+            const rows = (contributions ?? (
+                await workspace.json("/api/dca/contributions?status=all")
+            ).contributions ?? []).filter(item => item.status !== "pending");
             if (!rows.length) {
                 list.innerHTML = '<div class="dca-history-empty">No applied or skipped buys yet.</div>';
                 return;
@@ -457,6 +482,7 @@
             state = await readCanonicalDca();
         } catch (error) {
             log.warn("DCA reconciliation failed:", error);
+            panelLoadFailed();
             notify(
                 "DCA result is unknown — reconnect and refresh before retrying",
                 "warning",
@@ -469,17 +495,22 @@
         } catch (error) {
             log.warn("DCA reconciliation could not classify saved state:", error);
         }
+        let refreshed = false;
         try {
-            if (holdings) await afterHoldingsChange();
-            else await loadPanel();
+            refreshed = holdings ? await afterHoldingsChange() : await loadPanel();
         } catch (error) {
             log.warn("DCA reconciliation UI refresh failed:", error);
         }
         const messages = {
-            committed: ["DCA action completed — refreshed from saved state", "success"],
-            unchanged: ["DCA action did not complete — saved state is unchanged", "warning"],
-            unknown: [
-                "DCA result is still unknown — review the refreshed state before retrying",
+            committed: refreshed
+                ? ["DCA action completed — refreshed from saved state", "success"]
+                : ["DCA action completed and saved locally — some views are stale. Refresh before using them.", "warning"],
+            unchanged: [refreshed
+                ? "DCA action did not complete — saved state is unchanged"
+                : "DCA action did not complete — saved state is unchanged, but the view is stale. Refresh before retrying.", "warning"],
+            unknown: [refreshed
+                ? "DCA result is still unknown — review the refreshed state before retrying"
+                : "DCA result is still unknown and the view is stale — reconnect and refresh before retrying",
                 "warning",
             ],
         };
@@ -505,6 +536,7 @@
     } = {}) {
         if (mutationInFlight) return null;
         mutationInFlight = true;
+        panelLoadId += 1; // Retire reads that predate this mutation.
         try {
             const response = await workspace.response(path, init);
             const data = await response.json().catch(() => null);
@@ -542,8 +574,9 @@
     }
 
     async function afterHoldingsChange() {
-        await loadPanel();
+        const refreshed = await loadPanel();
         await holdingsChanged();
+        return refreshed;
     }
 
     async function patchPlan(id, payload, successMessage, before) {
@@ -570,6 +603,7 @@
         const action = button.dataset.dcaAction;
         if (action === "toggle-panel") return togglePanel();
         if (action === "toggle-history") return toggleHistory();
+        if (action === "retry-panel") return loadPanel();
         const id = Number(button.dataset.cid);
         const planId = Number(button.dataset.planId);
         const ticker = button.dataset.ticker || "";

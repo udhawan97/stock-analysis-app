@@ -19,6 +19,7 @@ function fakeDocument() {
     const elements = new Map([
         ["dca-panel", element({ hidden: true })],
         ["dca-btn", element()],
+        ["dca-load-status", element({ hidden: true })],
         ["dca-plans-section", element()],
         ["dca-plans-list", element()],
         ["dca-pending-section", element()],
@@ -44,13 +45,30 @@ function actionEvent(dataset) {
 }
 
 function emptyWorkspace(overrides = {}) {
-    return {
+    const workspace = {
         json: async url => url.includes("plans")
             ? { plans: [] }
             : { contributions: [] },
         response: async () => new Response("{}", { status: 200 }),
         ...overrides,
     };
+    const read = workspace.json;
+    workspace.json = async (...args) => {
+        const payload = await read(...args);
+        // Reconciliation fixtures specify transition fields; fill the remaining
+        // API fields so the real renderer also runs instead of throwing silently.
+        if (payload.plans) payload.plans = payload.plans.map(row => ({
+            ticker: "TEST", amount: 50, frequency: "weekly", is_active: true,
+            applied_count: 0, applied_amount: 0, applied_shares: 0,
+            applied_avg_cost: null, ...row,
+        }));
+        if (payload.contributions) payload.contributions = payload.contributions.map(row => ({
+            plan_id: 7, ticker: "TEST", shares: 0.5, price: 100, amount: 50,
+            exec_date: "2026-09-01", ...row,
+        }));
+        return payload;
+    };
+    return workspace;
 }
 
 test("open is the navigation seam and loads the panel through the workspace", async () => {
@@ -701,4 +719,137 @@ test("failed reconciliation keeps a lost mutation outcome unknown", async () => 
         "DCA result is unknown — reconnect and refresh before retrying",
         "warning",
     ]);
+});
+
+
+test("committed reconciliation with failed view refresh reports saved but stale and retry recovers", async () => {
+    const document = fakeDocument();
+    const messages = [];
+    const pending = document.elements.get("dca-pending-list");
+    let initial = true;
+    let reads = 0;
+    let retry = false;
+    let mutations = 0;
+    const workflow = createDcaWorkflow({
+        document,
+        notify: (...args) => messages.push(args),
+        workspace: emptyWorkspace({
+            response: async () => { mutations += 1; throw new Error("lost response"); },
+            json: async url => {
+                if (initial) return url.includes("plans") ? { plans: [] }
+                    : { contributions: [{ id: 3, status: "pending" }] };
+                reads += 1;
+                if (reads > 2 && !retry) throw new Error("offline");
+                return url.includes("plans") ? { plans: [] }
+                    : { contributions: [{ id: 3, status: "applied" }] };
+            },
+        }),
+    });
+    workflow.open(); await new Promise(resolve => setImmediate(resolve));
+    const previousCard = pending.innerHTML;
+    assert.match(previousCard, /data-cid="3"/);
+    initial = false;
+    await workflow.handleAction(actionEvent({ dcaAction: "apply", cid: "3" }));
+    assert.equal(pending.innerHTML, previousCard);
+    assert.match(messages.at(-1)[0], /completed.*view.*stale/i);
+    assert.equal(messages.at(-1)[1], "warning");
+    const status = document.elements.get("dca-load-status");
+    assert.equal(status.hidden, false);
+    assert.match(status.innerHTML, /retry-panel/);
+    assert.match(status.innerHTML, /view is stale/);
+    retry = true;
+    await workflow.handleAction(actionEvent({ dcaAction: "retry-panel" }));
+    assert.equal(pending.innerHTML, "");
+    assert.equal(status.hidden, true);
+    assert.equal(mutations, 1);
+});
+
+test("initial DCA load failure has a visible error and read-only retry", async () => {
+    const document = fakeDocument();
+    let offline = true;
+    let mutations = 0;
+    const workflow = createDcaWorkflow({ document, workspace: emptyWorkspace({
+        json: async url => {
+            if (offline) throw new Error("offline");
+            return url.includes("plans") ? { plans: [] } : { contributions: [] };
+        },
+        response: async () => { mutations += 1; return new Response("{}"); },
+    }) });
+    workflow.open();
+    await new Promise(resolve => setImmediate(resolve));
+    const status = document.elements.get("dca-load-status");
+    assert.equal(status.hidden, false);
+    assert.match(status.innerHTML, /could not load/i);
+    assert.match(status.innerHTML, /retry-panel/);
+    offline = false;
+    await workflow.handleAction(actionEvent({ dcaAction: "retry-panel" }));
+    assert.equal(status.hidden, true);
+    assert.equal(mutations, 0);
+});
+
+
+for (const [status, outcome] of [["pending", "unchanged"], ["dismissed", "unknown"]]) {
+    test("failed display refresh preserves " + outcome + " mutation guidance", async () => {
+        let reads = 0;
+        let mutations = 0;
+        const messages = [];
+        const workflow = createDcaWorkflow({
+            document: fakeDocument(), notify: (...args) => messages.push(args),
+            workspace: emptyWorkspace({
+                response: async () => { mutations += 1; throw new Error("lost response"); },
+                json: async url => {
+                    if (++reads > 2) throw new Error("offline");
+                    return url.includes("plans") ? { plans: [] }
+                        : { contributions: [{ id: 3, status }] };
+                },
+            }),
+        });
+        await workflow.handleAction(actionEvent({ dcaAction: "apply", cid: "3" }));
+        assert.match(messages.at(-1)[0], new RegExp(outcome));
+        assert.match(messages.at(-1)[0], /view is stale/);
+        assert.match(messages.at(-1)[0], /refresh before retrying/i);
+        assert.equal(messages.at(-1)[1], "warning");
+        assert.equal(mutations, 1);
+    });
+}
+
+test("successful mutation and failed panel GET retain an explicit stale view", async () => {
+    const document = fakeDocument();
+    const messages = [];
+    let offline = false;
+    let mutations = 0;
+    const workflow = createDcaWorkflow({
+        document, notify: (...args) => messages.push(args),
+        workspace: emptyWorkspace({
+            json: async url => {
+                if (offline) throw new Error("offline");
+                return url.includes("plans") ? { plans: [] }
+                    : { contributions: [{ id: 3, status: "pending" }] };
+            },
+            response: async () => { mutations += 1; return new Response('{"message":"Buy applied"}'); },
+        }),
+    });
+    workflow.open(); await new Promise(resolve => setImmediate(resolve));
+    offline = true;
+    await workflow.handleAction(actionEvent({ dcaAction: "apply", cid: "3" }));
+    assert.equal(messages.at(-1)[0], "Buy applied");
+    assert.match(document.elements.get("dca-load-status").innerHTML, /view is stale/);
+    assert.equal(mutations, 1);
+});
+
+test("visible DCA history renders from the same successful panel read", async () => {
+    const document = fakeDocument();
+    document.elements.get("dca-history-list").hidden = false;
+    let ledgerReads = 0;
+    const workflow = createDcaWorkflow({ document, workspace: emptyWorkspace({
+        json: async url => {
+            if (url.includes("plans")) return { plans: [] };
+            if (url.includes("status=all") && ++ledgerReads > 1) throw new Error("second read failed");
+            return { contributions: [{ id: 3, status: "applied" }] };
+        },
+    }) });
+    workflow.open(); await new Promise(resolve => setImmediate(resolve));
+    assert.match(document.elements.get("dca-history-list").innerHTML, /data-cid="3"/);
+    assert.equal(document.elements.get("dca-load-status").hidden, true);
+    assert.equal(ledgerReads, 1);
 });

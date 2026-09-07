@@ -7,7 +7,8 @@ snapshot of the database and ``.env`` at that moment. Rolling back:
 1. Takes a *fresh* verified backup of the CURRENT data first, so whichever data
    the user ends up with, the other copy is always recoverable — a rollback can
    never corrupt or silently discard newer data.
-2. Optionally restores the pre-update snapshot (the user's explicit choice); the
+2. Optionally queues the pre-update snapshot for a clean restart of the current
+   binary (the user's explicit choice); the
    default keeps current data, which an older binary can still read because
    migrations are additive-only.
 3. Reinstalls the previous version's binary — from the archived installer if
@@ -15,8 +16,8 @@ snapshot of the database and ``.env`` at that moment. Rolling back:
    the installer can run.
 
 The data steps are fully offline (backups are local). Only reinstalling the
-binary may need the network; if it's unavailable, the data is already safe and
-the user is pointed at the releases page.
+binary may need the network; if verification is unavailable, current data is
+kept and the user is pointed at the releases page.
 """
 from __future__ import annotations
 
@@ -42,6 +43,7 @@ _BUSY_STATUSES = {
     UpdateStatus.VERIFYING.value,
     UpdateStatus.BACKING_UP.value,
     UpdateStatus.INSTALLING.value,
+    UpdateStatus.ROLLBACK_PENDING.value,
 }
 
 
@@ -91,45 +93,23 @@ def rollback(restore_data: bool = False) -> dict:  # pylint: disable=too-many-re
             error="Couldn't safeguard your current data, so the rollback was paused.",
         )
 
-    # 2. Optionally restore the pre-update snapshot (explicit user choice).
-    if restore_data:
-        try:
-            backup_service.restore_backup(
-                rollback_point["db_backup"], backup_service.live_db_path()
-            )
-        except Exception:  # pylint: disable=broad-except
-            logger.exception("Failed to restore pre-update snapshot")
-            return update_service.mark(
-                UpdateStatus.ERROR, error="Couldn't restore the earlier data snapshot."
-            )
-        # The database is already restored at this point — a failure here is a
-        # narrower, less alarming problem than the message above, and must not
-        # be reported as "nothing happened" when the DB restore actually succeeded.
-        if rollback_point.get("env_backup"):
-            try:
-                backup_service.restore_env(rollback_point["env_backup"])
-            except Exception:  # pylint: disable=broad-except
-                logger.exception("Database restored, but .env restore failed")
-                return update_service.mark(
-                    UpdateStatus.ERROR,
-                    error=(
-                        "Your data was restored, but the saved settings (.env) "
-                        "couldn't be. You may need to reconfigure your API key."
-                    ),
-                )
-        update_log.event("rollback restored pre-update data snapshot")
-
-    # 3. Reinstall the previous binary.
-    installer = _resolve_previous_installer(rollback_point)
-    if installer is None:
-        update_log.event("rollback: previous installer unavailable")
+    # Verify the exact installer before requesting any data transition.
+    verified_installer = _resolve_previous_installer(rollback_point)
+    if verified_installer is None:
+        update_log.event("rollback: previous installer unavailable or unverified")
         return update_service.mark(
             UpdateStatus.ERROR,
-            error="Your data is safe. Reinstall the previous version from the "
-            "releases page to finish rolling back.",
+            error="Your data is safe. The previous installer couldn't be verified. "
+            "Reinstall it from the releases page to finish rolling back.",
         )
+    installer, installer_digest = verified_installer
+
+    if restore_data:
+        return _queue_data_rollback(rollback_point, installer, installer_digest)
 
     try:
+        if update_downloader.compute_sha256(installer) != installer_digest:
+            raise ValueError("Verified installer changed before handoff")
         update_installer.launch_installer(installer)
     except Exception:  # pylint: disable=broad-except
         logger.exception("Failed to launch rollback installer")
@@ -143,31 +123,65 @@ def rollback(restore_data: bool = False) -> dict:  # pylint: disable=too-many-re
     return state
 
 
-def _resolve_previous_installer(rollback_point: dict):
-    """Return a path to the previous version's installer, archived or downloaded."""
+
+def _queue_data_rollback(rollback_point: dict, installer, installer_digest: str) -> dict:
+    """Persist explicit consent for the current binary's next clean startup."""
+    from app import app_settings
     from pathlib import Path
 
-    archived = rollback_point.get("installer")
-    if archived and Path(archived).exists():
-        return Path(archived)
+    try:
+        if app_settings.load_settings().get("pending_db_restore"):
+            raise ValueError("A database restore is already queued")
+        snapshot = backup_service.resolve_backup_name(Path(rollback_point["db_backup"]).name)
+        if snapshot.resolve() != Path(rollback_point["db_backup"]).resolve():
+            raise ValueError("Rollback snapshot is outside the backup vault")
+        if not backup_service.verify_backup(snapshot):
+            raise ValueError("Rollback snapshot failed verification")
+        pending = {
+            "name": snapshot.name,
+            "kind": "rollback",
+            "installer": str(installer),
+            "installer_sha256": installer_digest,
+        }
+        if rollback_point.get("env_backup"):
+            environment = Path(rollback_point["env_backup"])
+            if environment.resolve().parent != backup_service.backups_dir().resolve():
+                raise ValueError("Rollback environment is outside the backup vault")
+            pending["environment"] = environment.name
+        app_settings.save_settings({"pending_db_restore": pending})
+    except Exception:
+        logger.exception("Could not queue rollback for a clean restart")
+        return update_service.mark(
+            UpdateStatus.ERROR, error="Couldn't queue the rollback. Your data is unchanged."
+        )
+    # Only the current binary can guarantee the new startup safety boundary.
+    return update_service.mark(UpdateStatus.ROLLBACK_PENDING)
+
+
+def _resolve_previous_installer(rollback_point: dict):
+    """Return the installer path and its trusted release digest, or refuse."""
+    from pathlib import Path
 
     version = rollback_point.get("version")
     if not version:
         return None
-
-    info = update_service.fetch_release_info(version)
-    if not info or not info.download_url or not info.asset_name:
-        return None
-
-    dest = update_downloader.archive_dir() / info.asset_name
     try:
-        update_downloader.download_update(info.download_url, dest)
-        if info.sha256_url:
-            sums = update_downloader.fetch_text(info.sha256_url)
-            if not update_downloader.verify_download(dest, sums, info.asset_name):
-                logger.error("Rollback installer failed verification")
+        info = update_service.fetch_release_info(version)
+        if not info or not info.asset_name or not info.sha256_url:
+            return None
+        archived = rollback_point.get("installer")
+        if archived and Path(archived).is_file():
+            dest = Path(archived)
+        else:
+            if not info.download_url:
                 return None
-        return dest
+            dest = update_downloader.archive_dir() / info.asset_name
+            update_downloader.download_update(info.download_url, dest)
+        digest = update_installer.verify_release_installer(dest, info.to_dict())
+        if not digest:
+            logger.error("Rollback installer failed verification")
+            return None
+        return dest, digest
     except Exception:  # pylint: disable=broad-except
-        logger.exception("Failed to fetch previous installer")
+        logger.exception("Failed to verify previous installer")
         return None

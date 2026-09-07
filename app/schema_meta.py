@@ -52,7 +52,7 @@ SCHEMA_VERSION = 9
 # Oldest app version whose ORM models can still read this schema. Additive-only
 # migrations (new tables/columns/indexes) keep this unchanged, so a normal
 # rollback to a recent prior version always works. A *destructive* migration must
-# raise this value AND must hard-require the pre-migration backup (see below).
+# raise this value; every populated version bump requires a verified backup.
 MIN_COMPATIBLE_APP_VERSION = "4.3.0"
 
 _META_TABLE = "app_meta"
@@ -214,9 +214,7 @@ def apply_migrations_safely(engine: Engine) -> MigrationResult:
       1. Take SQLite's cross-process writer lock and repeat the duplicate guard.
       2. Ensure ``app_meta`` and read the stored schema version.
       3. If the version is behind and the DB already holds data, take a verified
-         backup first (best effort — a failed backup is logged, and the current
-         migration set is additive/non-destructive so startup still proceeds; a
-         future destructive migration must instead hard-require this backup).
+         backup first. Abort and roll back if that backup cannot be verified.
       4. Run ``create_all`` (additive: only ever creates missing tables) followed
          by ``ensure_startup_migrations`` (idempotent).
       5. On failure, roll back and restore the verified backup, then re-raise.
@@ -272,7 +270,10 @@ def apply_migrations_safely(engine: Engine) -> MigrationResult:
                 logger.error(
                     "Could not create pre-migration backup: %s", type(exc).__name__
                 )
-                backup_path = None
+                raise RuntimeError(
+                    "Migration stopped: a verified pre-migration backup is required. "
+                    "Resolve backup storage availability and retry startup."
+                ) from exc
 
         models.Base.metadata.create_all(bind=connection)
         ensure_startup_migrations(connection)

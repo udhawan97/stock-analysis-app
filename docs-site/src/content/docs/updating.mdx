@@ -42,6 +42,24 @@ were on before. FolioOrb always snapshots your current data first, so nothing is
 either way — you choose whether to also restore your pre-update data. If the app fails to start
 after an update, it offers the rollback for you automatically.
 
+Keeping current data remains the default. If you also choose the earlier data,
+FolioOrb verifies the previous installer and queues the restore. **Quit and reopen
+FolioOrb** to continue. The current version takes another safety snapshot after
+your last writes, restores the earlier data before opening the database, and
+hands off to the installer. If the installer is missing or has changed before
+restart, current data is retained. If its launch fails after restoration, the
+restore receipt records that the earlier data was restored and installation failed;
+the safety snapshot remains in the Backup Vault.
+
+Archived installers must also match their release checksums. Verification may
+require an internet connection. When release signing is configured, the existing
+signature requirement also applies to rollback.
+
+An interrupted restore with incomplete recovery stops startup on subsequent
+launches. Preserve all database, staging, recovery files and the
+`restore-in-progress` marker until recovery has been deliberately resolved.
+Do not remove the marker just to bypass the startup message.
+
 ### Update preferences
 
 Under **Settings → Software Update** you can turn off **Automatically check for updates** or
@@ -64,6 +82,10 @@ lives for [macOS](/FolioOrb/install-macos/#where-your-data-lives) and
 
 For a manual clone, update the checkout and restart it through the repository
 launcher so the same runtime-profile checks apply:
+
+The desktop app and `python run.py` allow only one process to own a profile at a
+time. Directly starting Uvicorn bypasses these launcher checks and must not be
+used to perform a queued restore.
 
 ```bash
 cd FolioOrb
