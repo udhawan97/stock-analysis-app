@@ -25,7 +25,7 @@ peewee==4.4.0
 platformdirs==4.10.0
 protobuf==7.35.0
 pycparser==3.0
-pydantic==2.13.4
+pydantic==2.13.5
 pydantic_core==2.46.4
 Pygments==2.20.0
 python-dateutil==2.9.0.post0
