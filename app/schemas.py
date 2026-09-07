@@ -67,8 +67,8 @@ class HoldingCreate(BaseModel):
 
 class HoldingUpdate(BaseModel):
     """Fields that can be changed on an existing holding. All fields are optional."""
-    shares: Optional[float] = Field(None, gt=0)
-    avg_cost: Optional[float] = Field(None, gt=0)
+    shares: Optional[float] = Field(None, gt=0, allow_inf_nan=False)
+    avg_cost: Optional[float] = Field(None, gt=0, allow_inf_nan=False)
     notes: Optional[str] = Field(None, max_length=500)
     thesis_review_interval_days: Optional[int] = Field(None, ge=7, le=730)
     mark_thesis_reviewed: Optional[bool] = None

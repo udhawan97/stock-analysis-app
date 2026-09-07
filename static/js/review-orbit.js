@@ -32,6 +32,10 @@ window.ReviewOrbit = (() => {
         inboxFilter: savedChoice(REVIEW_INBOX_FILTER_KEY, REVIEW_INBOX_FILTERS, "all"),
         watchlist: null,
         plan: null,
+        planRequestId: 0,
+        targetDraftRevision: 0,
+        targetSaveInFlight: false,
+        planReadbackPending: false,
         overview: null,
         backups: null,
         rehearsalRequestId: 0,
@@ -430,8 +434,10 @@ window.ReviewOrbit = (() => {
         const button = $("review-bundle-export");
         const status = $("review-bundle-status");
         if (!button || !status) return;
-        if (targetCourseDirty()) {
-            showToast("Save the target course before bundling its snapshot.", "warning");
+        if (targetExportBlocked()) {
+            showToast(state.planReadbackPending || state.targetSaveInFlight
+                ? "Wait for the save and refresh the saved Plan before bundling its snapshot."
+                : "Save the target course before bundling its snapshot.", "warning");
             return;
         }
         button.disabled = true;
@@ -581,8 +587,10 @@ window.ReviewOrbit = (() => {
         };
         const config = exports[kind];
         if (!config) return;
-        if (kind === "plan" && targetCourseDirty()) {
-            showToast("Save the target course before exporting its snapshot.", "warning");
+        if (kind === "plan" && targetExportBlocked()) {
+            showToast(state.planReadbackPending || state.targetSaveInFlight
+                ? "Wait for the save and refresh the saved Plan before exporting its snapshot."
+                : "Save the target course before exporting its snapshot.", "warning");
             return;
         }
         try {
@@ -758,7 +766,7 @@ window.ReviewOrbit = (() => {
             if (run) run.disabled = true;
             return;
         }
-        if (save) save.disabled = false;
+        if (save) save.disabled = state.targetSaveInFlight;
         if (run) run.disabled = false;
 
         const driftItems = data.items.filter(item => item.drift_bps !== null);
@@ -819,13 +827,21 @@ window.ReviewOrbit = (() => {
         return Logic.targetCourseDirty(state.plan.items, inputs);
     }
 
+    function targetExportBlocked() {
+        return targetCourseDirty() || state.targetSaveInFlight || state.planReadbackPending;
+    }
+
     function syncTargetDraftState({ announce = false } = {}) {
         const dirty = targetCourseDirty();
         const exportButton = $("review-plan-export");
         const status = $("review-target-status");
         if (exportButton) {
-            exportButton.disabled = dirty || !state.plan?.items.length;
-            exportButton.title = dirty
+            exportButton.disabled = targetExportBlocked() || !state.plan?.items.length;
+            exportButton.title = state.targetSaveInFlight
+                ? "Wait for the target course save to finish before exporting."
+                : state.planReadbackPending
+                ? "Refresh the saved Plan before exporting."
+                : dirty
                 ? "Save the target course before exporting this draft."
                 : "Save the persisted target course and a fresh current valuation.";
         }
@@ -856,13 +872,20 @@ window.ReviewOrbit = (() => {
         syncTargetDraftState();
     }
 
-    async function loadPlan(force = false, { savedDraftAwaitingRefresh = false } = {}) {
+    async function loadPlan(force = false, {
+        savedDraftAwaitingRefresh = false,
+        submittedRevision = null,
+    } = {}) {
+        // A refresh begun during PUT cannot establish the result of that save.
+        if (state.targetSaveInFlight && !savedDraftAwaitingRefresh) {
+            return Logic.refreshOutcome("plan", 0, 2);
+        }
         if (!force && state.loaded.has("plan")) return Logic.refreshOutcome("plan", 2, 2);
         if (force) resetRehearsal();
         const hadPlan = Boolean(state.plan);
         const hadOverview = Boolean(state.overview);
-        const hadUnsavedDraft = hadPlan && targetCourseDirty();
-        const draftSnapshot = hadUnsavedDraft ? captureTargetDraft() : null;
+        const requestId = ++state.planRequestId;
+        const draftRevision = submittedRevision ?? state.targetDraftRevision;
         beginLoad(
             "review-book-pulse",
             "Valuing each saved portfolio independently…",
@@ -878,11 +901,24 @@ window.ReviewOrbit = (() => {
             PortfolioWorkspace.json("/api/review/plan"),
             PortfolioWorkspace.json("/api/review/overview"),
         ]);
+        if (requestId !== state.planRequestId) return Logic.refreshOutcome("plan", 0, 2);
+        // Capture at completion, so even edits begun after this GET survive.
+        const hadUnsavedDraft = hadPlan && targetCourseDirty();
+        const preserveDraft = hadPlan && (
+            state.targetDraftRevision !== draftRevision
+            || (!savedDraftAwaitingRefresh && (hadUnsavedDraft || state.planReadbackPending))
+        );
+        const draftSnapshot = preserveDraft ? captureTargetDraft() : null;
         let succeeded = 0;
         if (planResult.status === "fulfilled") {
+            const wasAwaitingReadback = state.planReadbackPending;
+            state.planReadbackPending = false;
             state.plan = planResult.value;
             renderTargetPlan();
-            if (draftSnapshot && !savedDraftAwaitingRefresh) restoreTargetDraft(draftSnapshot);
+            if (draftSnapshot) restoreTargetDraft(draftSnapshot);
+            if (wasAwaitingReadback && !savedDraftAwaitingRefresh && !targetCourseDirty()) {
+                $("review-target-status").textContent = "Target course read back. No trade was placed.";
+            }
             clearRefreshState("review-course-summary");
             clearRefreshState("review-course-card");
             succeeded += 1;
@@ -914,42 +950,65 @@ window.ReviewOrbit = (() => {
 
     async function saveTargets(event) {
         event.preventDefault();
+        if (state.targetSaveInFlight) return;
         const status = $("review-target-status");
+        const save = $("review-target-save");
+        const submittedRevision = state.targetDraftRevision;
         const items = Array.from(document.querySelectorAll(".review-target-input")).map(input => ({
             holding_id: Number(input.dataset.holdingId),
             target_weight_bps: input.value === "" ? null : Number(input.value),
         }));
+        state.targetSaveInFlight = true;
+        state.planRequestId += 1; // Retire every GET begun before this save.
+        clearRefreshState("review-course-summary");
+        clearRefreshState("review-course-card");
+        clearRefreshState("review-book-pulse");
+        if (save) save.disabled = true;
+        syncTargetDraftState();
         status.textContent = "Saving target course locally…";
         try {
-            await PortfolioWorkspace.json("/api/review/plan/targets", {
-                method: "PUT",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ items }),
-            });
-        } catch (error) {
-            status.textContent = apiErrorMessage(error, "Could not save target weights.");
-            return;
-        }
+            try {
+                await PortfolioWorkspace.json("/api/review/plan/targets", {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ items }),
+                });
+            } catch (error) {
+                status.textContent = apiErrorMessage(error, "Could not save target weights.");
+                return;
+            }
 
-        state.loaded.delete("plan");
-        try {
-            const outcome = await loadPlan(true, { savedDraftAwaitingRefresh: true });
-            if (!outcome.planSucceeded) {
-                status.textContent = "Target course saved locally, but the saved Plan could not be read back. No trade was placed.";
-                live("Target course saved locally; Plan readback is unavailable and no trade was placed.");
-                return;
+            state.planReadbackPending = true;
+            state.loaded.delete("plan");
+            let message;
+            try {
+                const outcome = await loadPlan(true, {
+                    savedDraftAwaitingRefresh: true, submittedRevision,
+                });
+                if (!outcome.planSucceeded) {
+                    message = "Target course saved locally, but the saved Plan could not be read back. No trade was placed.";
+                } else if (!outcome.overviewSucceeded) {
+                    message = "Target course saved. Portfolio overview refresh is still retryable. No trade was placed.";
+                } else {
+                    message = "Target course saved. No trade was placed.";
+                }
+            } catch (error) {
+                markPlanStale(error, { savedDraftAwaitingRefresh: true });
+                message = "Target course saved locally, but the saved Plan could not be read back. No trade was placed.";
             }
-            if (!outcome.overviewSucceeded) {
-                status.textContent = "Target course saved. Portfolio overview refresh is still retryable. No trade was placed.";
-                live("Target course saved locally; portfolio overview refresh remains retryable and no trade was placed.");
-                return;
+            if (state.targetDraftRevision !== submittedRevision
+                && (targetCourseDirty() || state.planReadbackPending)) {
+                message += " Newer target changes remain unsaved.";
             }
-            status.textContent = "Target course saved. No trade was placed.";
-            live("Target course saved locally; no trade was placed.");
-        } catch (error) {
-            markPlanStale(error, { savedDraftAwaitingRefresh: true });
-            status.textContent = "Target course saved locally, but the saved Plan could not be read back. No trade was placed.";
-            live("Target course saved locally; Plan readback is unavailable and no trade was placed.");
+            status.textContent = message;
+            live(message);
+        } finally {
+            state.targetSaveInFlight = false;
+            if (save) save.disabled = !state.plan?.items.length;
+            // Update export eligibility without replacing the save/readback receipt.
+            const message = status.textContent;
+            syncTargetDraftState();
+            status.textContent = message;
         }
     }
 
@@ -1153,6 +1212,12 @@ window.ReviewOrbit = (() => {
             status.textContent = restore.status === "restored"
                 ? `Restored ${restore.name} successfully. A safety copy of the previous database was kept.`
                 : `The restore of ${restore.name} failed before replacing the live database.`;
+            if (restore.status === "restored" && restore.installer_status === "failed") {
+                status.textContent += " The database was restored, but the previous installer could not be launched.";
+            }
+            if (restore.environment_status === "failed") {
+                status.textContent += " Saved settings could not be restored.";
+            }
         } else if (status) {
             status.hidden = true;
         }
@@ -1552,6 +1617,7 @@ window.ReviewOrbit = (() => {
         $("review-target-form")?.addEventListener("submit", saveTargets);
         $("review-target-form")?.addEventListener("input", event => {
             if (event.target.matches(".review-target-input")) {
+                state.targetDraftRevision += 1;
                 syncTargetDraftState({ announce: true });
             }
         });

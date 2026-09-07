@@ -236,6 +236,9 @@
         } else if (status === "backing_up") {
             el.updateSheetTitle.textContent = "Backing up your data…";
             el.updateSub.textContent = "Saving a safety copy of your portfolio.";
+        } else if (status === "rollback_pending") {
+            el.updateSheetTitle.textContent = "Rollback queued";
+            el.updateSub.textContent = "Quit and reopen FolioOrb to restore the earlier data and install the previous version. Your current data is unchanged until restart.";
         } else if (status === "installing") {
             el.updateSheetTitle.textContent = "Installing…";
             el.updateSub.textContent = "FolioOrb will restart shortly.";

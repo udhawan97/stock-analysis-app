@@ -40,6 +40,7 @@ AUTO_CLAIM_KEEP_DAYS = 45
 BACKUP_POLICY_FILENAME = "backup-policy.json"
 _operation_lock = threading.RLock()
 _operation_state = threading.local()
+_profile_lock_handles: dict = {}
 
 BACKUP_POLICY_DEFAULTS = {
     "auto_backup_enabled": False,
@@ -65,6 +66,51 @@ class EnvironmentSnapshotError(RuntimeError):
 
 class RestoreRecoveryError(RuntimeError):
     """A restore failed and the original canonical files could not be republished."""
+
+
+class ProfileInUseError(RuntimeError):
+    """Another launcher still owns this profile and its database connections."""
+
+
+def acquire_profile_lock() -> None:
+    """Hold an OS lock until process exit, before opening the canonical database."""
+    lock_path = paths.data_dir() / ".runtime.lock"
+    if lock_path in _profile_lock_handles:
+        return
+    handle = lock_path.open("a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            if handle.seek(0, os.SEEK_END) == 0:
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        handle.close()
+        raise ProfileInUseError(
+            "This FolioOrb profile is already open. Quit the other FolioOrb process "
+            "before restarting or restoring its data."
+        ) from exc
+    _profile_lock_handles[lock_path] = handle
+
+
+def _restore_barrier(target: Path) -> Path:
+    return Path(f"{target}.restore-in-progress")
+
+
+def require_completed_restore(target: Path) -> None:
+    """Refuse startup after interrupted publication, independently of settings.json."""
+    if _restore_barrier(target).exists():
+        raise RestoreRecoveryError(
+            "Database restore recovery is incomplete. Keep all database, staging and "
+            "failed files intact; resolve recovery before restarting FolioOrb."
+        )
 
 
 def _fsync_directory(directory: Path) -> None:
@@ -553,11 +599,14 @@ def apply_pending_restore() -> dict | None:
     """Apply a queued restore before the database engine is imported.
 
     The current database gets its own verified safety backup first. A failed
-    request is cleared so one bad vault item cannot trap the app in a startup
-    loop; the live file remains untouched on every pre-swap failure.
+    pre-publication request is cleared so one bad vault item cannot trap the
+    app in a startup loop. Incomplete canonical recovery is a hard, persistent
+    startup barrier; no database is opened until recovery is resolved.
     """
     from app import app_settings
 
+    live = live_db_path()
+    require_completed_restore(live)
     settings = app_settings.load_settings()
     pending = settings.get("pending_db_restore")
     if not isinstance(pending, dict) or not pending.get("name"):
@@ -565,14 +614,23 @@ def apply_pending_restore() -> dict | None:
 
     now = datetime.now(timezone.utc).isoformat()
     try:
+        is_rollback = pending.get("kind") == "rollback"
+        if is_rollback:
+            from app.services import update_downloader
+
+            if not pending.get("installer_sha256") or update_downloader.compute_sha256(
+                Path(pending["installer"])
+            ) != pending["installer_sha256"]:
+                raise ValueError("Queued installer changed; current data retained")
         requested = resolve_backup_name(str(pending["name"]))
-        if not verify_vault_backup(requested):
+        verifier = verify_backup if is_rollback else verify_vault_backup
+        if not verifier(requested):
             raise ValueError("Queued backup failed verification")
-        live = live_db_path()
         safety_name = None
         if live.exists():
             safety = create_verified_backup(
-                label="pre-manual-restore",
+                label="pre-rollback-restore" if is_rollback else "pre-manual-restore",
+                include_environment=is_rollback,
             ).database
             safety_name = safety.name
         restore_backup(requested, live)
@@ -582,8 +640,20 @@ def apply_pending_restore() -> dict | None:
             "safety_backup": safety_name,
             "completed_at": now,
         }
+        if is_rollback and pending.get("environment"):
+            try:
+                restore_env(backups_dir() / Path(pending["environment"]).name)
+                result["environment_status"] = "restored"
+            except Exception:  # pylint: disable=broad-except
+                result["environment_status"] = "failed"
+                logger.error("Database restored, but saved environment could not be restored")
+    except RestoreRecoveryError:
+        # The sidecar created before publication survives even if settings
+        # cannot be written. Never clear the request or open canonical SQLite.
+        raise
     except Exception as exc:  # pylint: disable=broad-except
         logger.error("Queued database restore failed: %s", type(exc).__name__)
+        require_completed_restore(live)
         result = {
             "status": "failed",
             "name": str(pending.get("name") or ""),
@@ -594,6 +664,21 @@ def apply_pending_restore() -> dict | None:
         "pending_db_restore": None,
         "last_db_restore": result,
     })
+    if result["status"] == "restored" and pending.get("kind") == "rollback":
+        from app.services import update_installer
+
+        try:
+            # Recheck the pinned release digest immediately before handoff.
+            if update_downloader.compute_sha256(Path(pending["installer"])) != (
+                pending["installer_sha256"]
+            ):
+                raise ValueError("Queued installer changed before handoff")
+            update_installer.launch_installer(Path(pending["installer"]))
+            result["installer_status"] = "installing"
+        except Exception:
+            logger.exception("Earlier data restored, but rollback installer could not start")
+            result["installer_status"] = "failed"
+        app_settings.save_settings({"last_db_restore": result})
     return result
 
 
@@ -752,10 +837,7 @@ def create_verified_backup(
 ) -> VerifiedBackup:
     """Create one independently verified database backup and optional env copy.
 
-    Caller policy deliberately stays outside this function: migrations may
-    treat a failure as best effort, while update and rollback callers hard-stop.
-    The safety choreography itself lives here so no caller can omit the live
-    holdings count or the post-publication verification.
+    Callers cannot omit the live holdings count or independent verification.
     """
     source = Path(source_db) if source_db is not None else live_db_path()
     expected = count_holdings(source)
@@ -788,16 +870,13 @@ def create_verified_backup(
 def restore_backup(backup_path: Path, target_db: Path, ts: str | None = None) -> bool:
     """Restore ``backup_path`` over ``target_db`` without destroying the current file.
 
-    Refuses to restore an unverified backup. The backup is first copied to a
-    staging file and re-verified there — only once that copy is confirmed intact
-    are the existing database and its WAL sidecars moved aside as
-    ``*.failed-<timestamp>`` and the staged copy swapped into place. This way a
-    failed copy (disk full, interrupted process) never leaves the live database
-    missing with no verified replacement ready — it's untouched instead.
-    Returns True on success.
+    All profile connections must be closed. Stage and verify the replacement
+    before moving the database and WAL sidecars to ``*.failed-<timestamp>``.
+    Keep a persistent startup barrier if canonical recovery is incomplete.
+    Returns True after publication, including nonfatal directory-sync faults.
     """
-    backup_path = Path(backup_path)
-    target_db = Path(target_db)
+    backup_path, target_db = Path(backup_path), Path(target_db)
+    require_completed_restore(target_db)
     if not verify_backup(backup_path):
         raise ValueError("Refusing to restore an unverified backup")
 
@@ -809,6 +888,20 @@ def restore_backup(backup_path: Path, target_db: Path, ts: str | None = None) ->
         _safe_remove(staging)
         raise ValueError("Restored copy failed verification — live database left untouched")
 
+    # Persist the barrier BEFORE moving any canonical byte. An interrupted
+    # process or incomplete recovery must remain blocked on every later start.
+    barrier = _restore_barrier(target_db)
+    try:
+        with barrier.open("x", encoding="utf-8") as handle:
+            json.dump({"staging": staging.name, "stamp": stamp}, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _fsync_directory(target_db.parent)
+    except FileExistsError as exc:
+        raise RestoreRecoveryError("Another restore owns the recovery barrier") from exc
+    except OSError:
+        _safe_remove(barrier)
+        raise
     moved: list[tuple[Path, Path]] = []
     try:
         for suffix in ("", "-wal", "-shm"):
@@ -820,6 +913,8 @@ def restore_backup(backup_path: Path, target_db: Path, ts: str | None = None) ->
         staging.replace(target_db)
     except OSError as forward_error:
         _rollback_restore_moves(moved, target_db.parent, forward_error)
+        barrier.unlink()
+        _fsync_directory(target_db.parent)
         raise
 
     try:
@@ -828,6 +923,13 @@ def restore_backup(backup_path: Path, target_db: Path, ts: str | None = None) ->
         # Publication is complete and the restored file is readable. Directory
         # fsync is a durability improvement, not a power-loss guarantee.
         logger.warning("Could not fsync restored database directory")
+    try:
+        barrier.unlink()
+        _fsync_directory(target_db.parent)
+    except OSError as exc:
+        if barrier.exists():
+            raise RestoreRecoveryError("Restored database recovery barrier remains") from exc
+        logger.warning("Restore completed; could not sync recovery barrier removal")
     logger.info("Restored database from backup %s", backup_path.name)
     return True
 

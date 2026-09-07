@@ -267,10 +267,11 @@ def test_backup_rejects_result_that_lost_holdings(file_db, monkeypatch):
 
     monkeypatch.setattr(backup_service, "create_backup", _empty_backup)
 
-    result = schema_meta.apply_migrations_safely(engine)
-
-    assert result.backed_up is False
-    assert result.backup_path is None
+    with pytest.raises(RuntimeError, match="verified pre-migration backup"):
+        schema_meta.apply_migrations_safely(engine)
+    assert schema_meta.read_schema_version(engine) == 0
+    with engine.connect() as connection:
+        assert connection.exec_driver_sql("SELECT COUNT(*) FROM holdings").scalar_one() == 1
 
 
 def test_had_data_detects_non_holdings_user_tables(file_db):
@@ -541,3 +542,56 @@ def test_v6_to_v7_adds_active_holding_uniqueness_without_deduping(tmp_path, monk
                 )
     finally:
         engine.dispose()
+
+
+@pytest.mark.parametrize("stored_version", [None, "5"])
+def test_backup_failure_rolls_back_schema_and_rows_then_retry_succeeds(
+    file_db, monkeypatch, stored_version
+):
+    engine, _ = file_db
+    from app import models
+
+    models.Base.metadata.create_all(bind=engine)
+    with engine.begin() as connection:
+        connection.execute(text("INSERT INTO portfolios (name) VALUES ('Preserved')"))
+        connection.execute(text(
+            "INSERT INTO holdings (portfolio_id, ticker, shares, avg_cost, is_active) "
+            "VALUES (1, 'EXAMPLE', 10, 100, 1)"
+        ))
+        connection.execute(text("ALTER TABLE holdings DROP COLUMN target_weight_bps"))
+        if stored_version is not None:
+            schema_meta._ensure_app_meta(connection)
+            schema_meta._write_meta(connection, "schema_version", stored_version)
+
+    def state():
+        with engine.connect() as connection:
+            schema = connection.exec_driver_sql(
+                "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+            ).fetchall()
+            holdings = connection.exec_driver_sql("SELECT * FROM holdings").fetchall()
+            metadata = (
+                connection.exec_driver_sql("SELECT * FROM app_meta ORDER BY key").fetchall()
+                if stored_version is not None else []
+            )
+            return schema, holdings, metadata
+
+    before = state()
+    real_backup = backup_service.create_verified_backup
+
+    def unavailable_backup(**_kwargs):
+        raise OSError("Synthetic backup storage unavailable")
+
+    monkeypatch.setattr(backup_service, "create_verified_backup", unavailable_backup)
+    with pytest.raises(RuntimeError, match="verified pre-migration backup"):
+        schema_meta.apply_migrations_safely(engine)
+    assert state() == before
+
+    monkeypatch.setattr(backup_service, "create_verified_backup", real_backup)
+    result = schema_meta.apply_migrations_safely(engine)
+    assert result.backed_up is True
+    assert result.schema_version == schema_meta.SCHEMA_VERSION
+    with engine.connect() as connection:
+        row = connection.exec_driver_sql(
+            "SELECT ticker, shares, avg_cost, target_weight_bps FROM holdings"
+        ).one()
+        assert tuple(row) == ("EXAMPLE", 10, 100, None)

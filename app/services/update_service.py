@@ -82,6 +82,7 @@ class UpdateStatus(str, Enum):
     BACKING_UP = "backing_up"
     READY = "ready"
     INSTALLING = "installing"
+    ROLLBACK_PENDING = "rollback_pending"
 
 
 class UpdateOffline(Exception):

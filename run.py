@@ -20,7 +20,10 @@ if __name__ == "__main__":
     from app.services import backup_service
 
     prepare_runtime_profile()
-    backup_service.apply_pending_restore()
+    backup_service.acquire_profile_lock()
+    restore_result = backup_service.apply_pending_restore()
+    if restore_result and restore_result.get("installer_status") == "installing":
+        raise SystemExit(0)
     threading.Thread(target=_open_browser, daemon=True).start()
     uvicorn.run(
         "app.main:app",

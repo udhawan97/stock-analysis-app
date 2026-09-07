@@ -15,6 +15,14 @@ import pytest
 from app.services import backup_service
 
 
+@pytest.fixture(autouse=True)
+def close_test_profile_locks():
+    before = set(backup_service._profile_lock_handles)
+    yield
+    for path in set(backup_service._profile_lock_handles) - before:
+        backup_service._profile_lock_handles.pop(path).close()
+
+
 def _mode(path: Path) -> int:
     return stat.S_IMODE(path.stat().st_mode)
 
@@ -683,3 +691,222 @@ def test_environment_snapshot_failure_keeps_the_verified_database_artifact(
     assert backup_service.verify_backup(
         caught.value.backup.database, expected_min_holdings=1
     )
+
+
+@pytest.mark.parametrize("partial_copy", [False, True])
+def test_incomplete_restore_blocks_second_start_even_with_settings_write_failure(
+    tmp_path, monkeypatch, partial_copy
+):
+    from app import app_settings, paths
+
+    monkeypatch.setattr(paths, "data_dir", lambda: tmp_path)
+    live, backup, originals = _restore_fault_fixture(tmp_path)
+    monkeypatch.setattr(backup_service, "live_db_path", lambda: live)
+    monkeypatch.setattr(backup_service, "_timestamp", lambda: "blocked")
+    # The synthetic sidecars are deliberately byte sentinels, not valid WAL.
+    monkeypatch.setattr(backup_service, "create_verified_backup", lambda **k:
+                        backup_service.VerifiedBackup(backup))
+    backup_service.queue_restore(backup.name)
+    real_replace = Path.replace
+
+    def fault_replace(source, destination):
+        if source.name.endswith(("staging-blocked", "failed-blocked")):
+            raise OSError("rename blocked")
+        return real_replace(source, destination)
+
+    def fault_copy(source, destination):
+        if partial_copy:
+            Path(destination).write_bytes(b"partial")
+        raise OSError("recovery copy failed")
+
+    monkeypatch.setattr(Path, "replace", fault_replace)
+    monkeypatch.setattr(backup_service.shutil, "copy2", fault_copy)
+    monkeypatch.setattr(app_settings, "save_settings", lambda values:
+                        (_ for _ in ()).throw(OSError("settings unavailable")))
+    with pytest.raises(backup_service.RestoreRecoveryError):
+        backup_service.apply_pending_restore()
+    assert Path(f"{live}.restore-in-progress").exists()
+    assert Path(f"{live}.staging-blocked").read_bytes() == backup.read_bytes()
+    for suffix, expected in originals.items():
+        assert Path(f"{live}{suffix}.failed-blocked").read_bytes() == expected
+    # A new launch must stop before reading settings or opening any DB.
+    monkeypatch.setattr(app_settings, "load_settings", lambda:
+                        (_ for _ in ()).throw(AssertionError("settings read")))
+    monkeypatch.setattr(sqlite3, "connect", lambda *a, **k:
+                        (_ for _ in ()).throw(AssertionError("database opened")))
+    with pytest.raises(backup_service.RestoreRecoveryError, match="recovery is incomplete"):
+        backup_service.apply_pending_restore()
+
+
+def test_profile_lock_contends_across_processes_and_releases_on_exit(tmp_path, monkeypatch):
+    import subprocess
+    import sys
+    from app import paths
+
+    monkeypatch.setattr(paths, "data_dir", lambda: tmp_path)
+    script = (
+        "import sys; from pathlib import Path; from app import paths; "
+        "from app.services import backup_service; "
+        "paths.data_dir=lambda: Path(sys.argv[1]); "
+        "backup_service.acquire_profile_lock()"
+    )
+
+    def child():
+        return subprocess.run(
+            [sys.executable, "-c", script, str(tmp_path)], check=False,
+            capture_output=True, text=True,
+        )
+
+    assert child().returncode == 0
+    # The first child exited: the next process can acquire its released lock.
+    backup_service.acquire_profile_lock()
+    locked = child()
+    assert locked.returncode != 0
+    assert "ProfileInUseError" in locked.stderr
+    backup_service._profile_lock_handles.pop(tmp_path / ".runtime.lock").close()
+    assert child().returncode == 0
+
+
+@pytest.mark.parametrize("launcher", ["desktop", "source"])
+def test_launchers_stop_on_persistent_barrier_before_database_start(
+    tmp_path, monkeypatch, launcher
+):
+    import builtins
+    import runpy
+    import sys
+    import desktop.main as desktop_main
+    from app import paths
+
+    monkeypatch.setattr(paths, "data_dir", lambda: tmp_path)
+    monkeypatch.setattr(paths, "prepare_runtime_profile", lambda: None)
+    live = tmp_path / "portfolio.db"
+    monkeypatch.setattr(backup_service, "live_db_path", lambda: live)
+    Path(f"{live}.restore-in-progress").write_text("recovery evidence", encoding="utf-8")
+    monkeypatch.setattr(desktop_main, "_find_free_port", lambda port: port)
+    monkeypatch.setattr(sys, "argv", ["desktop/main.py"])
+    surfaced = []
+    monkeypatch.setattr(desktop_main, "_surface_startup_error", lambda *args: surfaced.append(args))
+    original_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name in ("app.database", "app.main", "app.schema_meta"):
+            raise AssertionError("database startup crossed recovery barrier")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    for _attempt in range(2):
+        if launcher == "desktop":
+            assert desktop_main.main() == 1
+            assert "recovery requires attention" in surfaced[-1][0]
+        else:
+            with pytest.raises(backup_service.RestoreRecoveryError):
+                runpy.run_path("run.py", run_name="__main__")
+        marker_text = Path(f"{live}.restore-in-progress").read_text(encoding="utf-8")
+        assert marker_text == "recovery evidence"
+        assert not live.exists()
+
+
+def test_existing_recovery_marker_is_never_removed_by_failed_claim(tmp_path, monkeypatch):
+    live, backup, originals = _restore_fault_fixture(tmp_path)
+    barrier = Path(f"{live}.restore-in-progress")
+    original_open = Path.open
+
+    def raced_open(path, *args, **kwargs):
+        if path == barrier and args and args[0] == "x":
+            with original_open(barrier, "w", encoding="utf-8") as handle:
+                handle.write("other recovery owns this marker")
+            raise FileExistsError("another recovery")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", raced_open)
+    with pytest.raises(backup_service.RestoreRecoveryError):
+        backup_service.restore_backup(backup, live)
+    assert barrier.read_text(encoding="utf-8") == "other recovery owns this marker"
+    for suffix, expected in originals.items():
+        assert Path(f"{live}{suffix}").read_bytes() == expected
+
+
+@pytest.mark.parametrize("launcher", ["desktop", "source"])
+def test_second_launcher_refuses_before_pending_restore(tmp_path, monkeypatch, launcher):
+    import runpy
+    import subprocess
+    import sys
+    import desktop.main as desktop_main
+    from app import paths
+
+    monkeypatch.setattr(paths, "data_dir", lambda: tmp_path)
+    monkeypatch.setattr(paths, "prepare_runtime_profile", lambda: None)
+    monkeypatch.setattr(desktop_main, "_find_free_port", lambda port: port)
+    monkeypatch.setattr(sys, "argv", ["desktop/main.py"])
+    monkeypatch.setattr(backup_service, "apply_pending_restore", lambda:
+                        (_ for _ in ()).throw(AssertionError("restore reached")))
+    surfaced = []
+    monkeypatch.setattr(desktop_main, "_surface_startup_error", lambda *args: surfaced.append(args))
+    script = (
+        "import sys; from pathlib import Path; from app import paths; "
+        "from app.services import backup_service; "
+        "paths.data_dir=lambda: Path(sys.argv[1]); "
+        "backup_service.acquire_profile_lock(); print('locked', flush=True); sys.stdin.read()"
+    )
+    with subprocess.Popen(
+        [sys.executable, "-c", script, str(tmp_path)], stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    ) as owner:
+        try:
+            assert owner.stdout.readline().strip() == "locked"
+            if launcher == "desktop":
+                assert desktop_main.main() == 1
+                assert "already open" in surfaced[0][0]
+            else:
+                with pytest.raises(backup_service.ProfileInUseError):
+                    runpy.run_path("run.py", run_name="__main__")
+        finally:
+            owner.communicate(timeout=5)
+
+
+@pytest.mark.parametrize("fault", ["final_sync", "unlink_before", "unlink_after"])
+def test_post_publication_fault_never_reports_pre_swap_failure(tmp_path, monkeypatch, fault):
+    from app import app_settings, paths
+
+    monkeypatch.setattr(paths, "data_dir", lambda: tmp_path)
+    live = tmp_path / "portfolio.db"
+    monkeypatch.setattr(backup_service, "live_db_path", lambda: live)
+    _make_db(live, ["CURRENT"])
+    wanted = backup_service.backups_dir() / "manual-wanted.db"
+    _make_db(wanted, ["EARLIER"])
+    backup_service.queue_restore(wanted.name)
+    barrier = Path(f"{live}.restore-in-progress")
+    real_sync = backup_service._fsync_directory
+    real_unlink = Path.unlink
+
+    def faulted_sync(directory):
+        if fault == "final_sync" and directory == live.parent and not barrier.exists():
+            raise OSError("final directory sync failed after publication")
+        return real_sync(directory)
+
+    def faulted_unlink(path, *args, **kwargs):
+        if path == barrier and fault.startswith("unlink_"):
+            if fault == "unlink_after":
+                real_unlink(path, *args, **kwargs)
+            raise OSError("recovery barrier removal failed")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(backup_service, "_fsync_directory", faulted_sync)
+    monkeypatch.setattr(Path, "unlink", faulted_unlink)
+    if fault == "unlink_before":
+        with pytest.raises(backup_service.RestoreRecoveryError):
+            backup_service.apply_pending_restore()
+        assert barrier.exists()
+        assert app_settings.load_settings()["pending_db_restore"] is not None
+        with pytest.raises(backup_service.RestoreRecoveryError):
+            backup_service.apply_pending_restore()
+    else:
+        result = backup_service.apply_pending_restore()
+        assert result["status"] == "restored"
+        assert app_settings.load_settings()["last_db_restore"] == result
+        assert app_settings.load_settings()["pending_db_restore"] is None
+        assert not barrier.exists()
+        assert backup_service.apply_pending_restore() is None
+    assert _holdings(live) == ["EARLIER"]
+    safety = list(backup_service.backups_dir().glob("pre-manual-restore-*.db"))
+    assert _holdings(safety[0]) == ["CURRENT"]

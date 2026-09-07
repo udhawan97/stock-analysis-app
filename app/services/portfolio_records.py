@@ -286,6 +286,13 @@ def build_portable_archive(db: Session) -> bytes:
     members: list[tuple[str, bytes, int]] = []
     uncompressed = 0
     with db.begin():
+        connection = db.connection()
+        if connection.dialect.name == "sqlite":
+            # sqlite3 legacy mode does not begin a transaction for SELECT.
+            # A deferred BEGIN freezes all datasets at the first read without
+            # reserving the writer slot; the transaction ends before ZIP work.
+            if not connection.connection.driver_connection.in_transaction:
+                connection.exec_driver_sql("BEGIN")
         datasets = _model_rows(db)
         for name, columns, rows in datasets:
             payload = _csv_bytes(columns, rows)

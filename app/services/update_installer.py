@@ -191,6 +191,22 @@ def launch_installer(path) -> None:
     _launch_installer(path)
 
 
+def verify_release_installer(path: Path, info: dict) -> str | None:
+    """Bind installer bytes to release checksums and the current signing policy.
+
+    An archived path is not evidence of prior verification. Callers must verify
+    its current bytes against the release manifest just as for a new download.
+    """
+    if not info.get("sha256_url") or not info.get("asset_name"):
+        return None
+    sums = update_downloader.fetch_text(info["sha256_url"])
+    if _signature_ok(sums, info) and update_downloader.verify_download(
+        path, sums, info["asset_name"]
+    ):
+        return update_downloader.parse_sha256sums(sums, info["asset_name"])
+    return None
+
+
 def schedule_exit() -> None:
     """Quit the app shortly after so a launched installer can replace files.
 
